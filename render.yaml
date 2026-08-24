@@ -1,0 +1,18 @@
+# Render blueprint — free Node web service (persistent process, no per-request
+# timeout, which the slow model calls need). Import this repo on render.com and
+# it picks these up automatically. Set OPENROUTER_API_KEY in the dashboard.
+services:
+  - type: web
+    name: shareity-ai-service
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false # set the real value in the Render dashboard, never in the repo
+      - key: ALLOWED_ORIGIN
+        value: "*" # tighten to your dashboard origin, e.g. https://appdev.shareity.com
+      - key: APP_URL
+        value: "https://appdev.shareity.com"

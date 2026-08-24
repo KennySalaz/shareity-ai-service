@@ -1,0 +1,15 @@
+{
+  "name": "shareity-ai-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mini AI backend for Shareity 'Create with AI' — /api/ai/generate + /api/ai/badge (zero dependencies).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
