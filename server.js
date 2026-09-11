@@ -1,11 +1,14 @@
 /* eslint-disable no-console */
 // Shareity AI service — standalone mini backend for "Create with AI".
 //
-// Two endpoints the dashboard front calls; both keep the OpenRouter credential
+// The endpoints the dashboard front calls; all keep the OpenRouter credential
 // server-side (env var), never in the browser bundle:
-//   POST /api/ai/generate  -> challenge copy (text model, reads the clip frames)
-//   POST /api/ai/badge     -> challenge badge (image model)
-//   GET  /                 -> health check
+//   POST /api/ai/generate   -> challenge copy (text model, reads the clip frames)
+//   POST /api/ai/badge      -> challenge badge (image model)
+//   POST /api/ai/scene      -> step-1 cover photo (image model)
+//   POST /api/ai/ideas      -> a few challenge ideas (text model)
+//   POST /api/ai/animation  -> step-6 theme segment (HTML+SVG, text model)
+//   GET  /                  -> health check
 //
 // Ported almost verbatim from the dashboard's dev/aiHandlers.js so the real
 // backend can later reuse the exact same prompt + schema.
@@ -54,6 +57,13 @@ const MODELS = parseModels(
 const IDEAS_MODELS = process.env.AI_IDEAS_MODELS || process.env.AI_IDEAS_MODEL
   ? parseModels(process.env.AI_IDEAS_MODELS || process.env.AI_IDEAS_MODEL)
   : MODELS;
+// Animation theme (step 6): the model writes an HTML+CSS+SVG fragment (code, not
+// JSON), so it needs a strong visual-code model — free text models produce broken
+// markup. Sonnet 5 is the quality/price sweet spot. Override with
+// AI_ANIMATION_MODELS (chain) or AI_ANIMATION_MODEL.
+const ANIMATION_MODELS = process.env.AI_ANIMATION_MODELS || process.env.AI_ANIMATION_MODEL
+  ? parseModels(process.env.AI_ANIMATION_MODELS || process.env.AI_ANIMATION_MODEL)
+  : ["anthropic/claude-sonnet-5"];
 // Badges: Pollinations (free, no key, FLUX) by default, or an OpenRouter image
 // model when AI_BADGE_PROVIDER=openrouter (production parity, spends credit).
 const POLLINATIONS = "https://image.pollinations.ai/prompt/";
@@ -175,6 +185,56 @@ Rules:
 - The "reasoning" steps are TELEGRAPHIC NOTES, not sentences. 52 characters max
   each, first person, present tense, like thinking out loud.`;
 
+// ---------------------------------------------------------------- animation
+// Step 6 of the celebration animation: the model writes ONLY the themed segment
+// (what the challenge is about). It returns a self-contained HTML fragment the
+// dashboard injects into a 400x711 phone canvas over the brand-colour background.
+const ANIMATION_SYSTEM = `You are a motion designer at Shareity. You create ONE short, self-contained
+"celebration" animation segment for a completed challenge — the part that is
+ABOUT WHAT THE CHALLENGE IS. It plays inside a vertical 400x711 phone canvas,
+over a background that is already the challenge's brand colour.
+
+Output ONLY the HTML fragment — nothing else. No prose, no explanation, no
+markdown code fences. The very first character of your reply is "<".
+
+The fragment is exactly: one <style> block, then one
+<div class="theme-root"> ... </div>.
+
+Hard rules — follow ALL or the render breaks:
+- EVERY CSS selector is scoped under .theme-root (e.g. ".theme-root .ball{}").
+  Never write a bare "*", "body", "html" or unscoped tag selector.
+- .theme-root is position:absolute; inset:0; children positioned absolutely.
+- Pure CSS animation only. NO <script>, NO JS, NO on... attributes.
+- NO external resources: no <img>, no network url(...), no @import. Draw the
+  subject (the animal/object/scene of the challenge) with INLINE SVG in simple
+  flat shapes, thick outlines, friendly children's-book style.
+- Font 'Poppins', sans-serif is available. Include a big celebratory title
+  (like "GREAT JOB!") in white/light text with good contrast, plus a short
+  on-topic sub-line if it fits.
+- Light: at most ~30 animated elements; animations ~2-3s; infinite loops ok.
+  Use the challenge colour for accents.
+- The subject MUST clearly reflect the challenge topic. Chicken dance => a cute
+  dancing chicken; soccer => a bouncing soccer ball; tree planting => a growing
+  tree. Add confetti or sparkle. Make it delightful and unmistakably on-topic.`;
+
+// The fragment renders in a sandboxed iframe, but strip any <script> or on*
+// handler the model returns anyway, as defence in depth.
+function sanitizeThemeHtml(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/\son\w+\s*=\s*"[^"]*"/gi, "")
+    .replace(/\son\w+\s*=\s*'[^']*'/gi, "");
+}
+// Models sometimes wrap the fragment in fences or prepend a sentence; keep from
+// the first <style>/<div> onward.
+function extractFragment(text) {
+  let s = String(text || "").trim();
+  s = s.replace(/^\s*```(?:html)?\s*/i, "").replace(/\s*```\s*$/i, "");
+  const i = s.search(/<style|<div/i);
+  if (i > 0) s = s.slice(i);
+  return s.trim();
+}
+
 // ------------------------------------------------------------------- helpers
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
@@ -237,7 +297,10 @@ function orHeaders(apiKey) {
 // answer 200 with an EMPTY body, so we retry a model a couple of times before
 // moving to the next; parseContent is the final safety net for stray fences.
 const ATTEMPTS = 2;
-async function chatJSON(apiKey, messages, maxTokens = 3000, models = MODELS) {
+// `json` requests a JSON object back (the default, for the challenge/ideas calls).
+// Pass json:false when the model should return free-form text — the animation
+// theme is an HTML fragment, not a JSON object, so json_object would be wrong.
+async function chatJSON(apiKey, messages, maxTokens = 3000, models = MODELS, json = true) {
   let lastErr = "all models unavailable";
   for (const model of models) {
     for (let attempt = 0; attempt < ATTEMPTS; attempt++) {
@@ -250,7 +313,7 @@ async function chatJSON(apiKey, messages, maxTokens = 3000, models = MODELS) {
             model,
             max_tokens: maxTokens,
             messages,
-            response_format: { type: "json_object" },
+            ...(json ? { response_format: { type: "json_object" } } : {}),
             // Ask OpenRouter to return the real USD cost of the call in usage.cost.
             usage: { include: true },
           }),
@@ -512,6 +575,58 @@ async function handleIdeas(req, res) {
   }
 }
 
+// ------------------------------------------------------------------- animation
+// Step 6's theme: the model returns the HTML fragment (scoped under .theme-root)
+// that the dashboard drops into the celebration animation. Same shape the
+// dashboard's aiAnimationRemote.js expects: { theme: { html, label, sub } }.
+async function handleAnimation(req, res) {
+  const apiKey = key();
+  if (!apiKey) return send(res, 503, { error: "OPENROUTER_API_KEY is not set." });
+  try {
+    const {
+      name = "", description = "", color = "#0a84e8",
+      causeColor = "#59c7f9", tone = "Playful",
+    } = await readBody(req);
+
+    const user =
+      `Challenge name: "${name}"\n` +
+      `What it is about: "${description}"\n` +
+      `Brand colour: ${color}\n` +
+      `Cause colour: ${causeColor}\n` +
+      `Tone: ${tone}\n\n` +
+      `Return the themed celebration segment for THIS challenge as the HTML fragment.`;
+
+    // json:false — the model returns an HTML fragment, not a JSON object.
+    const { text, model, usage } = await chatJSON(
+      apiKey,
+      [
+        { role: "system", content: ANIMATION_SYSTEM },
+        { role: "user", content: user },
+      ],
+      8000,
+      ANIMATION_MODELS,
+      false,
+    );
+
+    const html = sanitizeThemeHtml(extractFragment(text));
+    if (!html || !html.includes("theme-root")) {
+      return send(res, 502, {
+        error: "The model returned an invalid theme",
+        detail: String(text).slice(0, 300),
+      });
+    }
+    send(res, 200, {
+      theme: { html, label: "GREAT JOB!", sub: "" },
+      model,
+      usage,
+      cost: usage?.cost ?? null,
+    });
+  } catch (err) {
+    console.error("[animation]", err);
+    send(res, 500, { error: String(err?.message || err) });
+  }
+}
+
 // --------------------------------------------------------------------- server
 const server = http.createServer(async (req, res) => {
   cors(res);
@@ -528,6 +643,7 @@ const server = http.createServer(async (req, res) => {
       key: key() ? "set" : "missing",
       textModel: MODELS[0],
       ideasModel: IDEAS_MODELS[0],
+      animationModel: ANIMATION_MODELS[0],
       badgeProvider: BADGE_PROVIDER,
       sceneProvider: SCENE_PROVIDER,
       imageModel: BADGE_PROVIDER === "openrouter" || SCENE_PROVIDER === "openrouter" ? IMAGE_MODEL : null,
@@ -537,6 +653,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/api/ai/badge") return handleBadge(req, res);
   if (req.method === "POST" && url.pathname === "/api/ai/scene") return handleScene(req, res);
   if (req.method === "POST" && url.pathname === "/api/ai/ideas") return handleIdeas(req, res);
+  if (req.method === "POST" && url.pathname === "/api/ai/animation") return handleAnimation(req, res);
 
   send(res, 404, { error: "not found" });
 });
@@ -546,6 +663,7 @@ server.listen(PORT, HOST, () => {
   console.log(`  OPENROUTER_API_KEY:  ${key() ? "found" : "MISSING — set it in the env"}`);
   console.log(`  Text model:          ${MODELS.join(", ")}`);
   console.log(`  Ideas model:         ${IDEAS_MODELS.join(", ")}`);
+  console.log(`  Animation model:     ${ANIMATION_MODELS.join(", ")}`);
   console.log(`  Badge provider:      ${BADGE_PROVIDER}${BADGE_PROVIDER === "openrouter" ? ` (${IMAGE_MODEL})` : ""}`);
   console.log(`  Scene provider:      ${SCENE_PROVIDER}${SCENE_PROVIDER === "openrouter" ? ` (${IMAGE_MODEL})` : ""}`);
   console.log(`  CORS origin:         ${ALLOWED_ORIGIN}\n`);
