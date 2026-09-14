@@ -48,5 +48,5 @@ VITE_AI_HOST=https://shareity-ai-service.onrender.com
 ## Security
 - The key lives only in this service's env. Set `ALLOWED_ORIGIN` to your dashboard
   origin for anything beyond a short demo — with `*`, any site can spend your credit.
-- OpenRouter is paid (Claude Opus 5 for text, ~$0.07 per badge image). Use a key
-  with a spending limit while testing.
+- OpenRouter is paid: Claude for text (Sonnet 5 by default) and ~$0.07 per image
+  (badges and covers, Gemini 3.1 Flash Image). Use a key with a spending limit while testing.

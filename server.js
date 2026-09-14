@@ -40,17 +40,14 @@ import { fileURLToPath } from "node:url";
 })();
 
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-// Text model(s) on OpenRouter. A ":free" id does NOT consume credit and reads the
-// clip frames to return the structured challenge; a paid id (e.g. anthropic/
-// claude-opus-5) works the same way with better output. Free pools rotate and
-// rate-limit (429), so we accept a chain and use the first that answers — one
-// hard-coded model is not reliable enough. Override with AI_TEXT_MODELS
-// (comma-separated) for a chain, or AI_TEXT_MODEL for a single model.
+// Text model(s) on OpenRouter. Accepts a chain and uses the first that answers, so
+// one model being down or rate-limited (429) does not break the wizard. Override
+// with AI_TEXT_MODELS (comma-separated) for a chain, or AI_TEXT_MODEL for one model.
 const parseModels = (v) => v.split(",").map((s) => s.trim()).filter(Boolean);
 const MODELS = parseModels(
   process.env.AI_TEXT_MODELS ||
     process.env.AI_TEXT_MODEL ||
-    "google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free",
+    "anthropic/claude-sonnet-5",
 );
 // Ideas are throwaway suggestions, so they can run on a cheaper model than the
 // main generate call. Falls back to MODELS when not set.
@@ -58,21 +55,15 @@ const IDEAS_MODELS = process.env.AI_IDEAS_MODELS || process.env.AI_IDEAS_MODEL
   ? parseModels(process.env.AI_IDEAS_MODELS || process.env.AI_IDEAS_MODEL)
   : MODELS;
 // Animation theme (step 6): the model writes an HTML+CSS+SVG fragment (code, not
-// JSON), so it needs a strong visual-code model — free text models produce broken
+// JSON), so it needs a strong visual-code model; weaker models produce broken
 // markup. Sonnet 5 is the quality/price sweet spot. Override with
 // AI_ANIMATION_MODELS (chain) or AI_ANIMATION_MODEL.
 const ANIMATION_MODELS = process.env.AI_ANIMATION_MODELS || process.env.AI_ANIMATION_MODEL
   ? parseModels(process.env.AI_ANIMATION_MODELS || process.env.AI_ANIMATION_MODEL)
   : ["anthropic/claude-sonnet-5"];
-// Badges: Pollinations (free, no key, FLUX) by default, or an OpenRouter image
-// model when AI_BADGE_PROVIDER=openrouter (production parity, spends credit).
-const POLLINATIONS = "https://image.pollinations.ai/prompt/";
-const BADGE_PROVIDER = process.env.AI_BADGE_PROVIDER || "pollinations";
+// Every generated image (badges and the step-1 cover) comes from this OpenRouter
+// image model. Override with AI_IMAGE_MODEL.
 const IMAGE_MODEL = process.env.AI_IMAGE_MODEL || "google/gemini-3.1-flash-image";
-// Cover scene (step 1): a vertical 9:16 phone-screen photo. Defaults to the badge
-// provider but can be set apart — Pollinations gives exact 9:16 framing for free,
-// which OpenRouter image models cannot guarantee.
-const SCENE_PROVIDER = process.env.AI_SCENE_PROVIDER || BADGE_PROVIDER;
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -86,10 +77,10 @@ const key = () => process.env.OPENROUTER_API_KEY || null;
 // ---------------------------------------------------------------- badge prompt
 function badgePrompt({ title, subject, color, palette }) {
   return [
-    "A flat vector app icon. FULL BLEED: the artwork fills the entire square edge to edge,",
-    "no border, no white outline, no sticker die-cut, no drop shadow,",
-    "no background outside the square.",
-    `Solid ${color} background.`,
+    "A flat vector illustration that IS the badge: it fills the whole square canvas edge to edge.",
+    `The solid ${color} background reaches all four edges and all four corners:`,
+    "square corners, not a rounded app icon, no white or empty margin around it,",
+    "no border, no outline, no sticker die-cut, no drop shadow.",
     `Centred subject: ${subject}. Simple flat shapes with thick dark outlines.`,
     palette ? `Accent colours: ${palette}.` : "",
     title
@@ -102,15 +93,52 @@ function badgePrompt({ title, subject, color, palette }) {
     .join(" ");
 }
 
-// Cover scene: a vertical phone-screen photo the challenge shows behind its title.
-function scenePrompt(idea) {
-  return [
-    "Cinematic vertical 9:16 phone-screen photo for a social-good video challenge.",
-    `Scene: ${idea}.`,
-    "Real people, candid documentary style, natural light, shallow depth of field,",
-    "full-bleed vertical portrait composition that fills a phone screen,",
-    "no text, no captions, no logos, no watermark, no UI.",
+// Cover scene: the full-screen photo behind the challenge UI (header card on top,
+// pitch and Accept button at the bottom), so the prompt steers the composition
+// around them and keeps any text out of the picture.
+function scenePrompt({ idea, title } = {}) {
+  const MAX = 1100;
+  // Quotes and markup around user text are what image models most often letter into the picture.
+  const clean = (v) =>
+    String(v ?? "")
+      .replace(/["`“”«»<>{}[\]#*_|\\]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/[\s.,;:!?¡¿]+$/, "");
+  const clip = (s, n) => (s.length <= n ? s : s.slice(0, n).replace(/\s+\S*$/, "") || s.slice(0, n));
+
+  const what = clean(idea);
+  const name = clean(title);
+
+  // EN/ES keywords. A false positive only adds the child rule; a miss keeps the scene adults-only,
+  // so an identifiable child is never requested either way.
+  const kids =
+    /\b(?:famil|niñ|alumn|guarder|infan)|\b(?:kids?|child|children|bab(?:y|ies)|toddlers?|teens?|students?|schools?|classroom|boys?|girls?|sons?|daughters?|parents?|moms?|dads?|bedtime|playground|nin[oa]s?|beb[eé]s?|hij[oa]s?|niet[oa]s?|escuelas?|colegios?|estudiantes?|adolescentes?|mam[aá]s?|pap[aá]s?|padres)(?![a-z])/i;
+  const people = kids.test(`${what} ${name}`)
+    ? "one or two adults in focus (any child only from behind or as hands, face never shown)"
+    : "one to three ordinary adults of mixed ages and backgrounds";
+
+  const lead = "Candid vertical smartphone photo, edge to edge, of this challenge being done: ";
+  const tail = [
+    ".",
+    "The brief may be English or Spanish: depict it in a fitting everyday place, never write its words.",
+    `Catch the one moment that proves it, shot by a friend at eye level, not a selfie, no phone in view: ${people}, mid-action, genuine joy or focus.`,
+    "Natural light, crisp subject, soft background blur, true colours, real skin and hands, plain clothes. Not an ad or stock.",
+    // The glass header card with white text covers the top ~21% and the pitch plus Accept button the
+    // bottom ~30%, both under dark scrims. The prompt never names them: mentioning text invites text.
+    "Faces a third down, action centred and readable as a thumbnail; top fifth calm and not bright, bottom third quiet ground, both real blurred parts of the place, never blank.",
+    "Dignified and safe: no risky stunts, weapons or political symbols; hardship shown with agency, never pity.",
+    "No text, letters, numbers, captions, signs, logos, brands, labels, printed clothes, timers, screens, watermarks, borders, device frames or UI.",
   ].join(" ");
+
+  // Hard budget: the objective wins and the title is dropped first.
+  const room = MAX - lead.length - tail.length;
+  let brief = clip(what, room);
+  if (name && !what.toLowerCase().includes(name.toLowerCase())) {
+    const named = brief ? `${brief}. Its name, ${name}, only sets the mood` : name;
+    brief = named.length <= room ? named : brief || clip(name, room);
+  }
+  return lead + (brief || "neighbours doing a small, joyful good deed together") + tail;
 }
 
 // ------------------------------------------------------------ challenge schema
@@ -265,7 +293,7 @@ function readBody(req) {
     req.on("error", reject);
   });
 }
-// Free models often wrap JSON in prose or markdown fences. Strip fences, then
+// Models sometimes wrap JSON in prose or markdown fences. Strip fences, then
 // fall back to extracting the outermost {...} block.
 function parseContent(text) {
   const s = String(text || "")
@@ -290,16 +318,23 @@ function orHeaders(apiKey) {
   };
 }
 
-// Free-model resilience: try the chain and use the first that answers. We ask for
+// Resilience: try the chain and use the first model that answers. We ask for
 // response_format json_object (widely supported, unlike json_schema) so the model
 // emits a JSON object instead of an empty or prose reply — the prompts already say
-// "reply only with JSON", which json_object requires. Free pools still occasionally
+// "reply only with JSON", which json_object requires. Providers still occasionally
 // answer 200 with an EMPTY body, so we retry a model a couple of times before
 // moving to the next; parseContent is the final safety net for stray fences.
 const ATTEMPTS = 2;
 // `json` requests a JSON object back (the default, for the challenge/ideas calls).
 // Pass json:false when the model should return free-form text — the animation
 // theme is an HTML fragment, not a JSON object, so json_object would be wrong.
+// OpenRouter answers 402 when the account has no credit left for the request. The
+// dashboard shows NO_CREDIT.error as is, so it is written for the admin.
+const NO_CREDIT = { error: "Sin saldo en OpenRouter", code: "no_credit" };
+function noCreditError(detail) {
+  return Object.assign(new Error(detail), { code: "no_credit" });
+}
+
 async function chatJSON(apiKey, messages, maxTokens = 3000, models = MODELS, json = true) {
   let lastErr = "all models unavailable";
   for (const model of models) {
@@ -344,6 +379,8 @@ async function chatJSON(apiKey, messages, maxTokens = 3000, models = MODELS, jso
       }
       lastErr = `${model} → ${upstream.status} ${raw.slice(0, 160)}`;
       console.error("[chatJSON]", lastErr);
+      // Credit is account-wide: no other model in the chain can answer either.
+      if (upstream.status === 402) throw noCreditError(lastErr);
       // brief retry on a shared-pool 429, then fall through to the next model
       if (upstream.status === 429 && attempt < ATTEMPTS - 1) {
         await new Promise((r) => setTimeout(r, 1500));
@@ -416,60 +453,51 @@ async function handleGenerate(req, res) {
     send(res, 200, { gen: parseContent(text), model, usage, cost: usage?.cost ?? null });
   } catch (err) {
     console.error("[generate]", err);
+    if (err?.code === "no_credit") return send(res, 402, NO_CREDIT);
     send(res, 500, { error: String(err?.message || err) });
   }
 }
 
+// Badges and covers share one OpenRouter call; only the framing and the seed
+// differ. Gemini image models honour image_config.aspect_ratio and seed even though
+// the model list does not advertise image_config.
+async function generateImage(apiKey, prompt, { aspectRatio, seed } = {}) {
+  const seedParam =
+    seed != null && seed !== "" && Number.isFinite(Number(seed)) ? { seed: Number(seed) } : {};
+  const upstream = await fetch(ENDPOINT, {
+    method: "POST",
+    headers: orHeaders(apiKey),
+    body: JSON.stringify({
+      model: IMAGE_MODEL,
+      modalities: ["image", "text"],
+      messages: [{ role: "user", content: prompt }],
+      image_config: { aspect_ratio: aspectRatio },
+      ...seedParam,
+      usage: { include: true },
+    }),
+  });
+  const raw = await upstream.text();
+  if (!upstream.ok) return { status: upstream.status, detail: raw.slice(0, 200), noCredit: upstream.status === 402 };
+  const json = JSON.parse(raw);
+  const image = json?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
+  if (!image) return { status: 502, detail: "The model returned no image" };
+  return { image, cost: json?.usage?.cost ?? null, model: json?.model || IMAGE_MODEL };
+}
+
 async function handleBadge(req, res) {
+  const apiKey = key();
+  if (!apiKey) return send(res, 503, { error: "OPENROUTER_API_KEY is not set." });
   try {
     const { title = "", subject = "", color = "#29ABE2", palette = "", seed } = await readBody(req);
     const prompt = badgePrompt({ title, subject, color, palette });
-
-    // Free path (default): Pollinations renders straight from the prompt in the
-    // URL, no API key. A different seed gives a different image — that is how the
-    // wizard asks for 3 versions. Returned as a base64 data URL so the browser
-    // re-encodes it without CORS taint.
-    if (BADGE_PROVIDER !== "openrouter") {
-      const url =
-        POLLINATIONS +
-        encodeURIComponent(prompt) +
-        "?width=1024&height=1024&nologo=true&model=flux" +
-        (seed != null ? `&seed=${encodeURIComponent(seed)}` : "");
-
-      const upstream = await fetch(url);
-      if (!upstream.ok) {
-        const detail = await upstream.text().catch(() => "");
-        console.error("[badge] pollinations", upstream.status, detail.slice(0, 200));
-        return send(res, upstream.status, { error: "Badge generation failed", detail: detail.slice(0, 200) });
-      }
-      const mime = upstream.headers.get("content-type") || "image/jpeg";
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      const image = `data:${mime};base64,${buf.toString("base64")}`;
-      return send(res, 200, { image, prompt, cost: 0 });
+    // A different seed gives a different image: that is how the wizard asks for 3 versions.
+    const out = await generateImage(apiKey, prompt, { aspectRatio: "1:1", seed });
+    if (!out.image) {
+      console.error("[badge] openrouter", out.status, out.detail);
+      if (out.noCredit) return send(res, 402, NO_CREDIT);
+      return send(res, out.status, { error: "Badge generation failed", detail: out.detail });
     }
-
-    // Paid path (production parity): OpenRouter image model, spends credit.
-    const apiKey = key();
-    if (!apiKey) return send(res, 503, { error: "OPENROUTER_API_KEY is not set." });
-    const upstream = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: orHeaders(apiKey),
-      body: JSON.stringify({
-        model: IMAGE_MODEL,
-        modalities: ["image", "text"],
-        messages: [{ role: "user", content: prompt }],
-        usage: { include: true },
-      }),
-    });
-    const raw = await upstream.text();
-    if (!upstream.ok) {
-      console.error("[badge] openrouter", upstream.status, raw.slice(0, 200));
-      return send(res, upstream.status, { error: "Badge generation failed", detail: raw.slice(0, 200) });
-    }
-    const json = JSON.parse(raw);
-    const image = json?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
-    if (!image) return send(res, 502, { error: "The model returned no image" });
-    send(res, 200, { image, prompt, cost: json?.usage?.cost ?? null });
+    send(res, 200, { image: out.image, prompt, cost: out.cost, model: out.model });
   } catch (err) {
     console.error("[badge]", err);
     send(res, 500, { error: String(err?.message || err) });
@@ -480,51 +508,18 @@ async function handleBadge(req, res) {
 // Step 1's cover image: a vertical 9:16 phone-screen photo built from the idea.
 // Video is upload-only for now, so this is the only generated cover.
 async function handleScene(req, res) {
+  const apiKey = key();
+  if (!apiKey) return send(res, 503, { error: "OPENROUTER_API_KEY is not set." });
   try {
-    const { prompt: idea = "", seed } = await readBody(req);
-    const prompt = scenePrompt(idea || "people doing a social-good challenge together");
-
-    // Free path (default): Pollinations at an exact 9:16 so it fills a phone screen.
-    if (SCENE_PROVIDER !== "openrouter") {
-      const url =
-        POLLINATIONS +
-        encodeURIComponent(prompt) +
-        "?width=768&height=1344&nologo=true&model=flux" +
-        (seed != null ? `&seed=${encodeURIComponent(seed)}` : "");
-      const upstream = await fetch(url);
-      if (!upstream.ok) {
-        const detail = await upstream.text().catch(() => "");
-        console.error("[scene] pollinations", upstream.status, detail.slice(0, 200));
-        return send(res, upstream.status, { error: "Scene generation failed", detail: detail.slice(0, 200) });
-      }
-      const mime = upstream.headers.get("content-type") || "image/jpeg";
-      const buf = Buffer.from(await upstream.arrayBuffer());
-      return send(res, 200, { image: `data:${mime};base64,${buf.toString("base64")}`, prompt, cost: 0 });
+    const { prompt: idea = "", title = "", seed } = await readBody(req);
+    const prompt = scenePrompt({ idea, title });
+    const out = await generateImage(apiKey, prompt, { aspectRatio: "9:16", seed });
+    if (!out.image) {
+      console.error("[scene] openrouter", out.status, out.detail);
+      if (out.noCredit) return send(res, 402, NO_CREDIT);
+      return send(res, out.status, { error: "Scene generation failed", detail: out.detail });
     }
-
-    // Paid path: OpenRouter image model. Aspect ratio is only a prompt hint here,
-    // so the front crops the result into its phone frame.
-    const apiKey = key();
-    if (!apiKey) return send(res, 503, { error: "OPENROUTER_API_KEY is not set." });
-    const upstream = await fetch(ENDPOINT, {
-      method: "POST",
-      headers: orHeaders(apiKey),
-      body: JSON.stringify({
-        model: IMAGE_MODEL,
-        modalities: ["image", "text"],
-        messages: [{ role: "user", content: prompt }],
-        usage: { include: true },
-      }),
-    });
-    const raw = await upstream.text();
-    if (!upstream.ok) {
-      console.error("[scene] openrouter", upstream.status, raw.slice(0, 200));
-      return send(res, upstream.status, { error: "Scene generation failed", detail: raw.slice(0, 200) });
-    }
-    const json = JSON.parse(raw);
-    const image = json?.choices?.[0]?.message?.images?.[0]?.image_url?.url;
-    if (!image) return send(res, 502, { error: "The model returned no image" });
-    send(res, 200, { image, prompt, cost: json?.usage?.cost ?? null });
+    send(res, 200, { image: out.image, prompt, cost: out.cost, model: out.model });
   } catch (err) {
     console.error("[scene]", err);
     send(res, 500, { error: String(err?.message || err) });
@@ -533,7 +528,7 @@ async function handleScene(req, res) {
 
 // ------------------------------------------------------------------- ideas
 // Screen 1's idea generator: a few challenge objectives (each with a title) the
-// user can pick from or ignore. Same free text model, no images returned.
+// user can pick from or ignore. Uses AI_IDEAS_MODELS (or the text chain).
 async function handleIdeas(req, res) {
   const apiKey = key();
   if (!apiKey) return send(res, 503, { error: "OPENROUTER_API_KEY is not set." });
@@ -567,10 +562,11 @@ async function handleIdeas(req, res) {
     const ideas = Array.isArray(parsed?.ideas) ? parsed.ideas.slice(0, count) : [];
     send(res, 200, { ideas, model, usage, cost: usage?.cost ?? null });
   } catch (err) {
-    // Ideas are optional suggestions: a flaky free model (empty body, no JSON)
+    // Ideas are optional suggestions: a flaky model (empty body, no JSON)
     // must not surface as an error. Degrade to an empty list — the wizard then
     // just invites the user to write their own.
     console.error("[ideas]", err);
+    if (err?.code === "no_credit") return send(res, 402, NO_CREDIT);
     send(res, 200, { ideas: [] });
   }
 }
@@ -623,6 +619,7 @@ async function handleAnimation(req, res) {
     });
   } catch (err) {
     console.error("[animation]", err);
+    if (err?.code === "no_credit") return send(res, 402, NO_CREDIT);
     send(res, 500, { error: String(err?.message || err) });
   }
 }
@@ -644,9 +641,7 @@ const server = http.createServer(async (req, res) => {
       textModel: MODELS[0],
       ideasModel: IDEAS_MODELS[0],
       animationModel: ANIMATION_MODELS[0],
-      badgeProvider: BADGE_PROVIDER,
-      sceneProvider: SCENE_PROVIDER,
-      imageModel: BADGE_PROVIDER === "openrouter" || SCENE_PROVIDER === "openrouter" ? IMAGE_MODEL : null,
+      imageModel: IMAGE_MODEL,
     });
   }
   if (req.method === "POST" && url.pathname === "/api/ai/generate") return handleGenerate(req, res);
@@ -664,7 +659,6 @@ server.listen(PORT, HOST, () => {
   console.log(`  Text model:          ${MODELS.join(", ")}`);
   console.log(`  Ideas model:         ${IDEAS_MODELS.join(", ")}`);
   console.log(`  Animation model:     ${ANIMATION_MODELS.join(", ")}`);
-  console.log(`  Badge provider:      ${BADGE_PROVIDER}${BADGE_PROVIDER === "openrouter" ? ` (${IMAGE_MODEL})` : ""}`);
-  console.log(`  Scene provider:      ${SCENE_PROVIDER}${SCENE_PROVIDER === "openrouter" ? ` (${IMAGE_MODEL})` : ""}`);
+  console.log(`  Image model:         ${IMAGE_MODEL}`);
   console.log(`  CORS origin:         ${ALLOWED_ORIGIN}\n`);
 });
